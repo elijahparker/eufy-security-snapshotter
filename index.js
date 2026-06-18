@@ -1,125 +1,121 @@
-require('dotenv').config();
-const { EufySecurity, DeviceType, PropertyName, CommandName } = require('eufy-security-client');
+const { EufySecurity, CommandName } = require('eufy-security-client');
 const ffmpeg = require('fluent-ffmpeg');
-const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { determineWeather } = require('./weather-inference');
 
-// Configuration
-const config = {
-    username: process.env.EUFY_USERNAME,
-    password: process.env.EUFY_PASSWORD,
-    deviceSerial: process.env.DEVICE_SERIAL,
-    presetIndex: parseInt(process.env.PRESET_INDEX || '0'),
-    schedule: process.env.SNAPSHOT_SCHEDULE || '0 12 * * *',
-    tokenPath: process.env.PERSISTENT_TOKEN_PATH || './persistent_token.json',
-    snapshotsDir: './snapshots'
-};
+class EufySecuritySnapshotter {
+    /**
+     * @param {Object} config
+     * @param {string} config.username - Eufy account email
+     * @param {string} config.password - Eufy account password
+     * @param {string} config.deviceSerial - Camera serial number
+     * @param {number|string} [config.presetIndex=0] - Preset index to rotate to
+     * @param {string} [config.snapshotsDir='./snapshots'] - Directory to save snapshot JPEGs and JSON metadata
+     * @param {string} [config.tokenPath='./persistent.json'] - Path to store session tokens
+     */
+    constructor(config) {
+        if (!config || !config.username || !config.password || !config.deviceSerial) {
+            throw new Error('EufySecuritySnapshotter requires username, password, and deviceSerial config options.');
+        }
 
-if (!fs.existsSync('.env')) {
-    console.error('[ERROR] .env file not found. Please copy .env.example to .env and fill in your credentials.');
-    process.exit(1);
-}
-
-if (!fs.existsSync(config.snapshotsDir)) {
-    fs.mkdirSync(config.snapshotsDir);
-}
-
-// Logger helper
-const log = (message) => {
-    console.log(`[${new Date().toISOString()}] ${message}`);
-};
-
-async function main() {
-    log('Starting Eufy Daily Snapshotter...');
-
-    const eufy = await EufySecurity.initialize({
-        username: config.username,
-        password: config.password,
-        language: 'en',
-        persistentDir: path.dirname(config.tokenPath), // use persistentDir instead of persistentTokenPath usually
-    });
-
-    eufy.on('tfa_request', () => {
-        log('2FA Code Required! Please check your email/app and enter it in the console.');
-        process.stdin.once('data', (data) => {
-            const code = data.toString().trim();
-            eufy.connectWithCode(code);
-        });
-    });
-
-    eufy.on('connect', async () => {
-        log('Connected to Eufy Cloud.');
+        this.config = {
+            username: config.username,
+            password: config.password,
+            deviceSerial: config.deviceSerial,
+            presetIndex: parseInt(config.presetIndex || '0'),
+            snapshotsDir: config.snapshotsDir || './snapshots',
+            tokenPath: config.tokenPath || './persistent.json',
+        };
+        this.eufy = null;
         
-        // Wait for devices to be loaded
-        setTimeout(async () => {
-            log('Devices loaded. Scheduling task...');
-            
-            cron.schedule(config.schedule, () => {
-                log('Running scheduled snapshot task...');
-                takeSnapshot(eufy);
+        // Ensure snapshots directory exists
+        if (!fs.existsSync(this.config.snapshotsDir)) {
+            fs.mkdirSync(this.config.snapshotsDir, { recursive: true });
+        }
+    }
+
+    /**
+     * Connects and initializes the session. Handles 2FA automatically if prompted.
+     * @returns {Promise<void>} Resolves when connection and device list are fully loaded.
+     */
+    async initialize() {
+        this.eufy = await EufySecurity.initialize({
+            username: this.config.username,
+            password: this.config.password,
+            language: 'en',
+            persistentDir: path.dirname(this.config.tokenPath),
+        });
+
+        // 2FA Handler
+        this.eufy.on('tfa_request', () => {
+            console.log(`[${new Date().toISOString()}] 2FA Code Required! Please check your email/app and enter it in the console.`);
+            process.stdin.once('data', (data) => {
+                const code = data.toString().trim();
+                this.eufy.connectWithCode(code);
+            });
+        });
+
+        this.eufy.on('error', (err) => {
+            console.error(`[${new Date().toISOString()}] Eufy Error: ${err.message}`);
+        });
+
+        return new Promise((resolve, reject) => {
+            this.eufy.on('connect', () => {
+                console.log(`[${new Date().toISOString()}] Connected to Eufy Cloud.`);
+                // Wait briefly for devices to load
+                setTimeout(resolve, 3000);
             });
 
-            if (process.argv.includes('--test')) {
-                log('Test mode enabled. Running snapshot immediately...');
-                await takeSnapshot(eufy);
-                shutdown();
-            }
-        }, 5000);
-    });
-
-    eufy.on('error', (err) => {
-        log(`Eufy Error: ${err.message}`);
-    });
-
-    try {
-        await eufy.connect();
-    } catch (err) {
-        log(`Connection Failed: ${err.message}`);
+            this.eufy.connect().catch(reject);
+        });
     }
 
-    // Graceful shutdown
-    const shutdown = async () => {
-        log('Shutting down...');
-        await eufy.close();
-        process.exit(0);
-    };
-
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
-}
-
-async function takeSnapshot(eufy, retryCount = 0) {
-    const devices = await eufy.getDevices();
-    const camera = devices.find(d => d.getSerial() === config.deviceSerial);
-
-    if (!camera) {
-        log(`Error: Camera with SN ${config.deviceSerial} not found.`);
-        return;
+    /**
+     * Closes the active session cleanly.
+     * @returns {Promise<void>}
+     */
+    async close() {
+        if (this.eufy) {
+            await this.eufy.close();
+        }
     }
 
-    try {
+    /**
+     * Rotates camera to preset, captures snapshot from H.264 stream (falls back to Eufy Cloud image if stream fails).
+     * @returns {Promise<string>} Path to the saved JPG.
+     */
+    async takeSnapshot() {
+        if (!this.eufy) {
+            throw new Error('EufySecuritySnapshotter is not initialized. Please call initialize() first.');
+        }
+
+        const devices = await this.eufy.getDevices();
+        const camera = devices.find(d => d.getSerial() === this.config.deviceSerial);
+
+        if (!camera) {
+            throw new Error(`Camera with SN ${this.config.deviceSerial} not found.`);
+        }
+
         const stationSN = camera.getStationSerial();
-        const station = await eufy.getStation(stationSN);
+        const station = await this.eufy.getStation(stationSN);
 
-        log(`Camera found: ${camera.getName()} (Type: ${camera.getDeviceType()}, SN: ${camera.getSerial()})`);
-        log(`Supported commands: ${JSON.stringify(camera.getCommands())}`);
+        console.log(`[${new Date().toISOString()}] Camera found: ${camera.getName()} (Type: ${camera.getDeviceType()}, SN: ${camera.getSerial()})`);
 
-        log(`Attempting to move to preset ${config.presetIndex}...`);
-        
+        // Move to preset if supported
         try {
-            await station.presetPosition(camera, config.presetIndex);
-            log('Waiting 5 seconds for stabilization...');
+            console.log(`[${new Date().toISOString()}] Attempting to move to preset ${this.config.presetIndex}...`);
+            await station.presetPosition(camera, this.config.presetIndex);
+            console.log(`[${new Date().toISOString()}] Waiting 5 seconds for stabilization...`);
             await new Promise(resolve => setTimeout(resolve, 5000));
         } catch (presetErr) {
-            log(`Preset movement not supported or failed: ${presetErr.message}. Skipping...`);
+            console.log(`[${new Date().toISOString()}] Preset movement not supported or failed: ${presetErr.message}. Skipping...`);
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = path.join(config.snapshotsDir, `snapshot_${timestamp}.jpg`);
-        
+        const filename = path.join(this.config.snapshotsDir, `snapshot_${timestamp}.jpg`);
+
         const downloadImage = (url, dest) => {
             return new Promise((resolve, reject) => {
                 const file = fs.createWriteStream(dest);
@@ -151,31 +147,42 @@ async function takeSnapshot(eufy, retryCount = 0) {
 
         const tryFallback = async () => {
             let pictureUrl = camera.getPropertyValue('hidden-pictureUrl') || camera.getPropertyValue('picture');
-            
             if (pictureUrl && pictureUrl.value) pictureUrl = pictureUrl.value;
             
             if (!pictureUrl || typeof pictureUrl !== 'string') {
-                log('Standard picture properties empty, searching raw properties...');
+                console.log(`[${new Date().toISOString()}] Standard picture properties empty, searching raw properties...`);
                 pictureUrl = findImageUrl(camera.getProperties());
             }
 
             if (pictureUrl && typeof pictureUrl === 'string') {
-                log(`Downloading fallback picture from: ${pictureUrl}`);
+                console.log(`[${new Date().toISOString()}] Downloading fallback picture from: ${pictureUrl}`);
                 await downloadImage(pictureUrl, filename);
-                log(`Snapshot saved via fallback: ${filename}`);
+                console.log(`[${new Date().toISOString()}] Snapshot saved via fallback: ${filename}`);
             } else {
-                throw new Error('This specific Eufy camera model does not support local P2P livestreaming via the API, and no recent event image URL is available in the Eufy Cloud to use as a fallback. Please ensure the camera is triggered recently or use a supported Pan/Tilt or Indoor model.');
+                throw new Error('This specific Eufy camera model does not support local P2P livestreaming via the API, and no recent event image URL is available in the Eufy Cloud to use as a fallback.');
             }
         };
 
+        // Try streaming if supported
         if (camera.hasCommand(CommandName.DeviceStartLivestream)) {
-            log('Starting livestream...');
+            console.log(`[${new Date().toISOString()}] Starting livestream...`);
             let frameCaptured = false;
+
+            const stopStream = async () => {
+                try {
+                    if (camera.hasCommand(CommandName.DeviceStopLivestream)) {
+                        console.log(`[${new Date().toISOString()}] Stopping livestream...`);
+                        await this.eufy.stopStationLivestream(camera.getSerial());
+                    }
+                } catch (err) {
+                    console.error(`[${new Date().toISOString()}] Error stopping stream: ${err.message}`);
+                }
+            };
 
             const onLivestreamStart = (station, device, metadata, videostream) => {
                 if (device.getSerial() !== camera.getSerial()) return;
 
-                log('Livestream started. Capturing frame with FFmpeg...');
+                console.log(`[${new Date().toISOString()}] Livestream started. Capturing frame with FFmpeg...`);
                 ffmpeg(videostream)
                     .inputFormat('h264')
                     .outputOptions([
@@ -183,91 +190,88 @@ async function takeSnapshot(eufy, retryCount = 0) {
                         '-q:v 2'
                     ])
                     .on('end', () => {
-                        log(`Snapshot saved: ${filename}`);
+                        console.log(`[${new Date().toISOString()}] Snapshot saved: ${filename}`);
                         frameCaptured = true;
-                        stopStream(eufy, camera);
-                        eufy.removeListener('station livestream start', onLivestreamStart);
+                        stopStream();
+                        this.eufy.removeListener('station livestream start', onLivestreamStart);
                     })
                     .on('error', (err) => {
-                        log(`FFmpeg Error: ${err.message}`);
-                        stopStream(eufy, camera);
-                        eufy.removeListener('station livestream start', onLivestreamStart);
+                        console.error(`[${new Date().toISOString()}] FFmpeg Error: ${err.message}`);
+                        stopStream();
+                        this.eufy.removeListener('station livestream start', onLivestreamStart);
                     })
                     .save(filename);
             };
 
-            eufy.on('station livestream start', onLivestreamStart);
+            this.eufy.on('station livestream start', onLivestreamStart);
 
             try {
-                await eufy.startStationLivestream(camera.getSerial());
-
-                // Safety timeout to stop livestream if ffmpeg fails to finish within 20s
+                await this.eufy.startStationLivestream(camera.getSerial());
+                // Safety timeout (20s)
                 await new Promise(resolve => setTimeout(resolve, 20000));
                 
                 if (!frameCaptured) {
-                    log('Capture timeout: Stopping livestream.');
-                    stopStream(eufy, camera);
-                    eufy.removeListener('station livestream start', onLivestreamStart);
+                    this.eufy.removeListener('station livestream start', onLivestreamStart);
+                    await stopStream();
                     throw new Error('Livestream capture timed out.');
                 }
             } catch (err) {
-                log(`Livestream failed: ${err.message}. Trying image fallback...`);
+                console.log(`[${new Date().toISOString()}] Livestream failed: ${err.message}. Trying image fallback...`);
                 await tryFallback();
             }
         } else {
-            log('Livestream command not supported by this device. Using image fallback...');
+            console.log(`[${new Date().toISOString()}] Livestream command not supported by this device. Using image fallback...`);
             await tryFallback();
         }
 
-        // Run local ONNX weather inference
+        return filename;
+    }
+
+    /**
+     * Rotates camera, captures snapshot, runs local weather inference, and saves companion metadata log.
+     * @returns {Promise<{ imagePath: string, metadataPath: string, weather: Object }>}
+     */
+    async takeSnapshotWithWeather() {
+        const imagePath = await this.takeSnapshot();
+        
+        console.log(`[${new Date().toISOString()}] Analyzing weather on captured image...`);
+        const weather = await determineWeather(imagePath);
+        console.log(`[${new Date().toISOString()}] Weather classification: ${weather.label.toUpperCase()} (${(weather.confidence * 100).toFixed(2)}% confidence)`);
+        
+        const metadataPath = imagePath.replace('.jpg', '.json');
+        const metadata = {
+            timestamp: new Date().toISOString(),
+            camera: {
+                serial: this.config.deviceSerial
+            },
+            weather: {
+                label: weather.label,
+                confidence: weather.confidence,
+                scores: weather.scores
+            }
+        };
+
         try {
-            log('Analyzing weather on captured image...');
-            const weather = await determineWeather(filename);
-            log(`Weather classification: ${weather.label.toUpperCase()} (${(weather.confidence * 100).toFixed(2)}% confidence)`);
-            
-            const metadataPath = filename.replace('.jpg', '.json');
-            const metadata = {
-                timestamp: new Date().toISOString(),
-                camera: {
+            const devices = await this.eufy.getDevices();
+            const camera = devices.find(d => d.getSerial() === this.config.deviceSerial);
+            if (camera) {
+                metadata.camera = {
                     name: camera.getName(),
                     serial: camera.getSerial(),
                     model: camera.getModel()
-                },
-                weather: {
-                    label: weather.label,
-                    confidence: weather.confidence,
-                    scores: weather.scores
-                }
-            };
-            fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
-            log(`Weather metadata saved to: ${metadataPath}`);
-        } catch (weatherErr) {
-            log(`Weather analysis failed: ${weatherErr.message}`);
-        }
+                };
+            }
+        } catch (e) {}
 
-    } catch (err) {
-        log(`Task Attempt ${retryCount + 1} Failed: ${err.message}`);
-        if (camera) await stopStream(eufy, camera);
+        fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+        console.log(`[${new Date().toISOString()}] Weather metadata saved to: ${metadataPath}`);
 
-        if (retryCount < 1) {
-            log('Retrying in 10 seconds...');
-            await new Promise(resolve => setTimeout(resolve, 10000));
-            return takeSnapshot(eufy, retryCount + 1);
-        } else {
-            log('Max retries reached. Snapshot failed.');
-        }
+        return {
+            imagePath,
+            metadataPath,
+            weather
+        };
     }
 }
 
-async function stopStream(eufy, camera) {
-    try {
-        if (camera.hasCommand(CommandName.DeviceStopLivestream)) {
-            log('Stopping livestream...');
-            await eufy.stopStationLivestream(camera.getSerial());
-        }
-    } catch (err) {
-        log(`Error stopping stream: ${err.message}`);
-    }
-}
-
-main();
+module.exports = EufySecuritySnapshotter;

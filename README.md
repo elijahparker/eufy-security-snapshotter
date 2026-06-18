@@ -1,83 +1,150 @@
-# Eufy Daily Snapshotter with Local Weather Classification
+# Eufy Security Snapshotter with Local Weather Classification
 
-An automated Node.js application that schedules daily snapshots from a Eufy Pan/Tilt camera, moves the camera to a preset angle, captures a high-quality frame, and performs **fully offline local AI image inference** using ONNX to classify the weather.
+A modular Node.js SDK and utility for capturing snapshots from Eufy Pan/Tilt cameras (including fully custom support for the **eufyCam C31 / T817L**), rotating the camera to specific preset angles, and running **fully offline local AI image inference** using ONNX to classify weather conditions.
 
 ## Key Features
-- **Persistent Sessions:** Saves authentication credentials locally to minimize 2FA prompts.
-- **Preset Positioning:** Automatically moves the camera to a specific preset position before snapshotting.
-- **Stabilization Delay:** Delays capturing for 5 seconds to let the camera adjust its exposure and finish moving.
+- **Object-Oriented SDK Design:** Exports a reusable, developer-friendly class that integrates seamlessly into larger applications.
+- **Persistent Sessions:** Automatically saves authentication tokens locally to minimize 2FA prompt frequency.
+- **Preset Position Control:** Moves Pan/Tilt cameras to specific preset indices before taking the capture.
+- **Efficient Frame Capturing:** Establishes local P2P livestreaming, captures a single high-quality frame with FFmpeg, and instantly shuts down the stream. Falling back to Eufy Cloud image URLs if livestreaming is unsupported.
 - **Local ONNX Weather Inference:** Runs a lightweight 5.9MB pre-trained 14-class ResNet50 model offline in under 650ms.
-- **Smart Weather Filtering:** Restricts classification and re-normalizes prediction confidence to atmospheric conditions only (`cloudy`, `fogsmog`, `rain`, `shine` (sunny), `rainbow`, and `snow`) while ignoring misleading lens condensation/dew.
-- **Companion Metadata Logs:** Saves a companion `.json` file for every snapshot containing accurate timestamps, camera details, and sorted weather classification probability scores.
-- **Scheduled Execution:** Operates continuously based on custom cron schedules.
+- **Re-normalized Prediction Filtering:** Restricts predictions to 6 core atmospheric weather classes (`cloudy`, `fogsmog`, `rain`, `shine` (sunny), `rainbow`, and `snow`), re-normalizing their relative confidence to 100% and discarding misleading classifications like lens condensation or dew.
 
-## Architecture
-- **Runtime:** Node.js
-- **Libraries:**
-  - `eufy-security-client`: Connects to Eufy Cloud and establishes local P2P livestreaming.
-  - `fluent-ffmpeg`: Captures high-quality frames directly from the live H.264 stream.
-  - `onnxruntime-node`: Performs fast, zero-dependency local weather inference.
-  - `jimp`: Preprocesses JPEG pixels into the BGR format tensor expected by the neural network.
-  - `node-cron`: Manages continuous scheduling.
-  - `dotenv`: Handles local environment variables.
+---
 
-## Prerequisites
-- **Node.js:** Latest LTS recommended.
+## SDK API Reference
+
+### Installation
+
+```bash
+npm install eufy-security-snapshotter
+```
+
+### Usage Example
+
+```javascript
+const EufySecuritySnapshotter = require('eufy-security-snapshotter');
+
+async function main() {
+    // 1. Instantiate the class with your credentials and config
+    const snapshotter = new EufySecuritySnapshotter({
+        username: "your-email@example.com",
+        password: "your-password",
+        deviceSerial: "T817LT002605061C", // Camera serial number
+        presetIndex: 3,                   // Preset to rotate to (optional)
+        snapshotsDir: "./custom_snapshots",// Where to save files (optional)
+        tokenPath: "./persistent.json"    // Session cache (optional)
+    });
+
+    try {
+        // 2. Initialize and connect to the Eufy Cloud & Local P2P
+        console.log("Connecting...");
+        await snapshotter.initialize();
+
+        // 3. Option A: Capture a standard raw image snapshot
+        const imagePath = await snapshotter.takeSnapshot();
+        console.log(`Saved snapshot to: ${imagePath}`);
+
+        // 4. Option B: Capture snapshot AND run local weather analysis
+        const { imagePath, metadataPath, weather } = await snapshotter.takeSnapshotWithWeather();
+        console.log(`Snapshot Path: ${imagePath}`);
+        console.log(`Weather JSON Path: ${metadataPath}`);
+        console.log(`Detected Weather: ${weather.label} (${(weather.confidence * 100).toFixed(2)}%)`);
+
+    } catch (error) {
+        console.error("Snapshot failed:", error.message);
+    } finally {
+        // 5. Cleanly close the session
+        await snapshotter.close();
+    }
+}
+
+main();
+```
+
+---
+
+## Demo Utility
+
+This repository includes a standalone demo utility (`demo.js`) allowing you to trigger on-demand snapshots and verify your setup.
+
+### 1. Prerequisites
+- **Node.js:** Latest LTS version.
 - **FFmpeg:** Must be installed on your system path.
-  - **Amazon Linux / Fedora:**
+  - *Amazon Linux / RHEL / Fedora:*
     ```bash
     sudo dnf install ffmpeg-free -y
     ```
-  - **Ubuntu / Debian:**
+  - *Ubuntu / Debian:*
     ```bash
     sudo apt update && sudo apt install ffmpeg -y
     ```
 
-## Installation & Setup
-
-1. **Clone the Repository:**
+### 2. Setup Configuration
+1. Clone the repository and install dependencies:
    ```bash
-   git clone https://github.com/elijahparker/eufy-daily-snapshotter.git
-   cd eufy-daily-snapshotter
-   ```
-
-2. **Install Dependencies:**
-   ```bash
+   git clone https://github.com/elijahparker/eufy-security-snapshotter.git
+   cd eufy-security-snapshotter
    npm install
    ```
 
-3. **Configure Environment Variables:**
-   Copy the example environment file and fill in your details:
+2. Copy the environment template:
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` to configure your:
-   - Eufy Account credentials (username, password)
-   - Camera Serial Number (`DEVICE_SERIAL`)
-   - Target Preset position (`PRESET_INDEX`)
-   - Snapshot Schedule cron expression (`SNAPSHOT_SCHEDULE`)
 
-## Usage
+3. Open `.env` and fill in your details:
+   ```env
+   EUFY_USERNAME="your-eufy-account-email@example.com"
+   EUFY_PASSWORD="your-eufy-account-password"
+   DEVICE_SERIAL="T817LT002605061C"
+   PRESET_INDEX=3
+   ```
 
-### Run a Test Capture Immediately
-To verify the connection, preset rotation, stream capturing, and weather classification on-demand:
+### 3. Run the Demo
+
+To capture a snapshot and run the **ONNX weather classification** (saves a `.jpg` and `.json` in `./snapshots`):
 ```bash
-node index.js --test
+node demo.js
 ```
 
-### Start the Daily Scheduler
-To keep the application running continuously in the background on your schedule:
+To run a **raw snapshot only** without loading the ONNX model or running classification:
 ```bash
-node index.js
+node demo.js --only-snapshot
 ```
 
-### View Saved Snapshots & Weather Data
-- **Snapshots** are saved under the `./snapshots` folder.
-- **Weather scores** are saved under matching `.json` files:
-  ```bash
-  # View the most recent weather prediction details
-  cat $(ls -t snapshots/*.json | head -n 1)
-  ```
+### 4. View Saved Weather Logs
+A companion `.json` file is saved with each capture preserving the complete list of normalized class scores:
+```bash
+# Print the results of the newest snapshot weather analysis
+cat $(ls -t snapshots/*.json | head -n 1)
+```
+
+Example JSON metadata output:
+```json
+{
+  "timestamp": "2026-06-18T14:01:49.389Z",
+  "camera": {
+    "name": "Garage",
+    "serial": "T817LT002605061C",
+    "model": "T817L"
+  },
+  "weather": {
+    "label": "cloudy",
+    "confidence": 0.6898,
+    "scores": {
+      "cloudy": 0.6898,
+      "rain": 0.2014,
+      "fogsmog": 0.0542,
+      "shine": 0.0315,
+      "snow": 0.0182,
+      "rainbow": 0.0049
+    }
+  }
+}
+```
+
+---
 
 ## License
 MIT License.
