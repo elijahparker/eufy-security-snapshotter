@@ -1,6 +1,6 @@
 {
   "name": "eufy-security-snapshotter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Modular Node.js SDK for capturing snapshots from Eufy Pan/Tilt cameras (including custom support for eufyCam C31) with offline local ONNX weather classification.",
   "main": "index.js",
   "scripts": {
