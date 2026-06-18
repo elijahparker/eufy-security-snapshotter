@@ -1,18 +1,33 @@
 {
-  "name": "eufy_capture",
+  "name": "eufy-daily-snapshotter",
   "version": "1.0.0",
-  "description": "",
+  "description": "Automated daily snapshots from a Eufy Pan/Tilt camera with local ONNX weather classification.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "eufy",
+    "camera",
+    "snapshot",
+    "onnx",
+    "weather",
+    "inference"
+  ],
+  "author": "Elijah Parker",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elijahparker/eufy-daily-snapshotter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/elijahparker/eufy-daily-snapshotter/issues"
+  },
+  "homepage": "https://github.com/elijahparker/eufy-daily-snapshotter#readme",
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.4.2",
-    "eufy-security-client": "file:/home/ec2-user/eufy-security-client",
+    "eufy-security-client": "^3.8.0-dev.25",
     "fluent-ffmpeg": "^2.1.3",
     "jimp": "^1.6.1",
     "node-cron": "^4.2.1",
