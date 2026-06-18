@@ -1,5 +1,5 @@
 {
-  "name": "eufy-daily-snapshotter",
+  "name": "eufy-security-snapshotter",
   "version": "1.0.0",
   "description": "Automated daily snapshots from a Eufy Pan/Tilt camera with local ONNX weather classification.",
   "main": "index.js",
