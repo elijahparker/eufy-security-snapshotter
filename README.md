@@ -41,15 +41,14 @@ async function main() {
         console.log("Connecting...");
         await snapshotter.initialize();
 
-        // 3. Option A: Capture a standard raw image snapshot
-        const imagePath = await snapshotter.takeSnapshot();
-        console.log(`Saved snapshot to: ${imagePath}`);
+        // 3. Option A: Capture a standard raw image snapshot (returns Buffer)
+        const imageBuffer = await snapshotter.takeSnapshot();
+        console.log(`Captured image buffer of size: ${imageBuffer.length} bytes`);
 
-        // 4. Option B: Capture snapshot AND run local weather analysis
-        const { imagePath, metadataPath, weather } = await snapshotter.takeSnapshotWithWeather();
-        console.log(`Snapshot Path: ${imagePath}`);
-        console.log(`Weather JSON Path: ${metadataPath}`);
-        console.log(`Detected Weather: ${weather.label} (${(weather.confidence * 100).toFixed(2)}%)`);
+        // 4. Option B: Capture snapshot AND run local weather analysis (returns Buffer + Metadata Object)
+        const { imageBuffer, metadata } = await snapshotter.takeSnapshotWithWeather();
+        console.log(`Captured image buffer of size: ${imageBuffer.length} bytes`);
+        console.log(`Detected Weather: ${metadata.weather.label} (${(metadata.weather.confidence * 100).toFixed(2)}%)`);
 
     } catch (error) {
         console.error("Snapshot failed:", error.message);

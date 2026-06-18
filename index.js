@@ -12,7 +12,6 @@ class EufySecuritySnapshotter {
      * @param {string} config.password - Eufy account password
      * @param {string} config.deviceSerial - Camera serial number
      * @param {number|string} [config.presetIndex=0] - Preset index to rotate to
-     * @param {string} [config.snapshotsDir='./snapshots'] - Directory to save snapshot JPEGs and JSON metadata
      * @param {string} [config.tokenPath='./persistent.json'] - Path to store session tokens
      */
     constructor(config) {
@@ -25,15 +24,9 @@ class EufySecuritySnapshotter {
             password: config.password,
             deviceSerial: config.deviceSerial,
             presetIndex: parseInt(config.presetIndex || '0'),
-            snapshotsDir: config.snapshotsDir || './snapshots',
             tokenPath: config.tokenPath || './persistent.json',
         };
         this.eufy = null;
-        
-        // Ensure snapshots directory exists
-        if (!fs.existsSync(this.config.snapshotsDir)) {
-            fs.mkdirSync(this.config.snapshotsDir, { recursive: true });
-        }
     }
 
     /**
@@ -83,8 +76,9 @@ class EufySecuritySnapshotter {
     }
 
     /**
-     * Rotates camera to preset, captures snapshot from H.264 stream (falls back to Eufy Cloud image if stream fails).
-     * @returns {Promise<string>} Path to the saved JPG.
+     * Rotates camera to preset, captures snapshot and returns it as a Buffer.
+     * Falls back to Eufy Cloud image if stream fails.
+     * @returns {Promise<Buffer>} The image data in a JPEG Buffer.
      */
     async takeSnapshot() {
         if (!this.eufy) {
@@ -113,21 +107,15 @@ class EufySecuritySnapshotter {
             console.log(`[${new Date().toISOString()}] Preset movement not supported or failed: ${presetErr.message}. Skipping...`);
         }
 
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = path.join(this.config.snapshotsDir, `snapshot_${timestamp}.jpg`);
-
-        const downloadImage = (url, dest) => {
+        const downloadImageToBuffer = (url) => {
             return new Promise((resolve, reject) => {
-                const file = fs.createWriteStream(dest);
                 https.get(url, (response) => {
-                    response.pipe(file);
-                    file.on('finish', () => {
-                        file.close(resolve);
+                    const chunks = [];
+                    response.on('data', chunk => chunks.push(chunk));
+                    response.on('end', () => {
+                        resolve(Buffer.concat(chunks));
                     });
-                }).on('error', (err) => {
-                    fs.unlink(dest, () => {});
-                    reject(err);
-                });
+                }).on('error', reject);
             });
         };
 
@@ -145,7 +133,7 @@ class EufySecuritySnapshotter {
             return null;
         };
 
-        const tryFallback = async () => {
+        const tryFallbackToBuffer = async () => {
             let pictureUrl = camera.getPropertyValue('hidden-pictureUrl') || camera.getPropertyValue('picture');
             if (pictureUrl && pictureUrl.value) pictureUrl = pictureUrl.value;
             
@@ -156,8 +144,9 @@ class EufySecuritySnapshotter {
 
             if (pictureUrl && typeof pictureUrl === 'string') {
                 console.log(`[${new Date().toISOString()}] Downloading fallback picture from: ${pictureUrl}`);
-                await downloadImage(pictureUrl, filename);
-                console.log(`[${new Date().toISOString()}] Snapshot saved via fallback: ${filename}`);
+                const buffer = await downloadImageToBuffer(pictureUrl);
+                console.log(`[${new Date().toISOString()}] Snapshot buffer downloaded successfully via fallback.`);
+                return buffer;
             } else {
                 throw new Error('This specific Eufy camera model does not support local P2P livestreaming via the API, and no recent event image URL is available in the Eufy Cloud to use as a fallback.');
             }
@@ -166,79 +155,93 @@ class EufySecuritySnapshotter {
         // Try streaming if supported
         if (camera.hasCommand(CommandName.DeviceStartLivestream)) {
             console.log(`[${new Date().toISOString()}] Starting livestream...`);
-            let frameCaptured = false;
+            
+            return new Promise(async (resolvePromise, rejectPromise) => {
+                let frameCaptured = false;
 
-            const stopStream = async () => {
-                try {
-                    if (camera.hasCommand(CommandName.DeviceStopLivestream)) {
-                        console.log(`[${new Date().toISOString()}] Stopping livestream...`);
-                        await this.eufy.stopStationLivestream(camera.getSerial());
+                const stopStream = async () => {
+                    try {
+                        if (camera.hasCommand(CommandName.DeviceStopLivestream)) {
+                            console.log(`[${new Date().toISOString()}] Stopping livestream...`);
+                            await this.eufy.stopStationLivestream(camera.getSerial());
+                        }
+                    } catch (err) {
+                        console.error(`[${new Date().toISOString()}] Error stopping stream: ${err.message}`);
                     }
-                } catch (err) {
-                    console.error(`[${new Date().toISOString()}] Error stopping stream: ${err.message}`);
-                }
-            };
+                };
 
-            const onLivestreamStart = (station, device, metadata, videostream) => {
-                if (device.getSerial() !== camera.getSerial()) return;
+                const onLivestreamStart = (station, device, metadata, videostream) => {
+                    if (device.getSerial() !== camera.getSerial()) return;
 
-                console.log(`[${new Date().toISOString()}] Livestream started. Capturing frame with FFmpeg...`);
-                ffmpeg(videostream)
-                    .inputFormat('h264')
-                    .outputOptions([
-                        '-frames:v 1',
-                        '-q:v 2'
-                    ])
-                    .on('end', () => {
-                        console.log(`[${new Date().toISOString()}] Snapshot saved: ${filename}`);
+                    console.log(`[${new Date().toISOString()}] Livestream started. Capturing frame with FFmpeg...`);
+                    
+                    const passThrough = new (require('stream').PassThrough)();
+                    const chunks = [];
+                    passThrough.on('data', chunk => chunks.push(chunk));
+                    passThrough.on('end', () => {
+                        const buffer = Buffer.concat(chunks);
+                        console.log(`[${new Date().toISOString()}] Snapshot buffer created successfully from stream.`);
                         frameCaptured = true;
                         stopStream();
                         this.eufy.removeListener('station livestream start', onLivestreamStart);
-                    })
-                    .on('error', (err) => {
-                        console.error(`[${new Date().toISOString()}] FFmpeg Error: ${err.message}`);
-                        stopStream();
+                        resolvePromise(buffer);
+                    });
+
+                    ffmpeg(videostream)
+                        .inputFormat('h264')
+                        .outputOptions([
+                            '-frames:v 1',
+                            '-q:v 2'
+                        ])
+                        .format('image2')
+                        .on('error', (err) => {
+                            console.error(`[${new Date().toISOString()}] FFmpeg Error: ${err.message}`);
+                            stopStream();
+                            this.eufy.removeListener('station livestream start', onLivestreamStart);
+                            rejectPromise(err);
+                        })
+                        .pipe(passThrough);
+                };
+
+                this.eufy.on('station livestream start', onLivestreamStart);
+
+                try {
+                    await this.eufy.startStationLivestream(camera.getSerial());
+                    // Safety timeout (20s)
+                    await new Promise(resolve => setTimeout(resolve, 20000));
+                    
+                    if (!frameCaptured) {
                         this.eufy.removeListener('station livestream start', onLivestreamStart);
-                    })
-                    .save(filename);
-            };
-
-            this.eufy.on('station livestream start', onLivestreamStart);
-
-            try {
-                await this.eufy.startStationLivestream(camera.getSerial());
-                // Safety timeout (20s)
-                await new Promise(resolve => setTimeout(resolve, 20000));
-                
-                if (!frameCaptured) {
-                    this.eufy.removeListener('station livestream start', onLivestreamStart);
-                    await stopStream();
-                    throw new Error('Livestream capture timed out.');
+                        await stopStream();
+                        throw new Error('Livestream capture timed out.');
+                    }
+                } catch (err) {
+                    console.log(`[${new Date().toISOString()}] Livestream failed: ${err.message}. Trying image fallback...`);
+                    try {
+                        const fallbackBuffer = await tryFallbackToBuffer();
+                        resolvePromise(fallbackBuffer);
+                    } catch (fallbackErr) {
+                        rejectPromise(fallbackErr);
+                    }
                 }
-            } catch (err) {
-                console.log(`[${new Date().toISOString()}] Livestream failed: ${err.message}. Trying image fallback...`);
-                await tryFallback();
-            }
+            });
         } else {
             console.log(`[${new Date().toISOString()}] Livestream command not supported by this device. Using image fallback...`);
-            await tryFallback();
+            return tryFallbackToBuffer();
         }
-
-        return filename;
     }
 
     /**
-     * Rotates camera, captures snapshot, runs local weather inference, and saves companion metadata log.
-     * @returns {Promise<{ imagePath: string, metadataPath: string, weather: Object }>}
+     * Rotates camera, captures snapshot buffer, runs local weather inference, and returns buffer and metadata object.
+     * @returns {Promise<{ imageBuffer: Buffer, metadata: Object }>}
      */
     async takeSnapshotWithWeather() {
-        const imagePath = await this.takeSnapshot();
+        const imageBuffer = await this.takeSnapshot();
         
-        console.log(`[${new Date().toISOString()}] Analyzing weather on captured image...`);
-        const weather = await determineWeather(imagePath);
+        console.log(`[${new Date().toISOString()}] Analyzing weather on captured image buffer...`);
+        const weather = await determineWeather(imageBuffer);
         console.log(`[${new Date().toISOString()}] Weather classification: ${weather.label.toUpperCase()} (${(weather.confidence * 100).toFixed(2)}% confidence)`);
         
-        const metadataPath = imagePath.replace('.jpg', '.json');
         const metadata = {
             timestamp: new Date().toISOString(),
             camera: {
@@ -263,13 +266,9 @@ class EufySecuritySnapshotter {
             }
         } catch (e) {}
 
-        fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
-        console.log(`[${new Date().toISOString()}] Weather metadata saved to: ${metadataPath}`);
-
         return {
-            imagePath,
-            metadataPath,
-            weather
+            imageBuffer,
+            metadata
         };
     }
 }
